@@ -1,0 +1,139 @@
+from __future__ import print_function
+import os.path
+import pickle
+import time
+from concurrent.futures import ThreadPoolExecutor
+from google.auth.transport.requests import Request
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
+# If modifying these SCOPES, delete the file token.pickle.
+SCOPES = ['https://www.googleapis.com/auth/drive']
+
+def authenticate_drive_api():
+    """Authenticates and returns the Google Drive service using OAuth 2.0."""
+    creds = None
+    if os.path.exists('token.pickle'):
+        with open('token.pickle', 'rb') as token:
+            creds = pickle.load(token)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file('client_secret.json', SCOPES)
+            creds = flow.run_local_server(port=0)
+        with open('token.pickle', 'wb') as token:
+            pickle.dump(creds, token)
+
+    return build('drive', 'v3', credentials=creds)
+
+def list_files_recursive(service, folder_id):
+    """Recursively lists all files and subfolders in a folder."""
+    page_token = None
+    all_files = []
+
+    while True:
+        print(f"Fetching files from folder: {folder_id}")  # Debugging message
+        results = service.files().list(
+            q=f"'{folder_id}' in parents and trashed = false",
+            fields='nextPageToken, files(id, name, mimeType)',
+            pageSize=100,  # Limit the number of files per request
+            pageToken=page_token
+        ).execute()
+        items = results.get('files', [])
+        if not items:
+            break
+
+        for item in items:
+            print(f"Found file/folder: {item['name']} (ID: {item['id']})")  # Debugging message
+            all_files.append(item)
+            # Check if it's a folder, if so, recursively list its contents
+            if item['mimeType'] == 'application/vnd.google-apps.folder':
+                all_files.extend(list_files_recursive(service, item['id']))
+
+        page_token = results.get('nextPageToken', None)
+        if page_token is None:
+            break
+
+    return all_files
+
+def list_non_company_emails(service, folder_id):
+    """Lists all non-company email addresses that have permissions within a folder and its subfolders."""
+    non_company_emails = set()
+
+    # Recursively list all files and subfolders
+    all_files = list_files_recursive(service, folder_id)
+
+    for item in all_files:
+        file_id = item['id']
+        permissions = service.permissions().list(fileId=file_id, fields="permissions(id, emailAddress)").execute()
+        for permission in permissions.get('permissions', []):
+            email = permission.get('emailAddress')
+            if email and '@companydomain.com' not in email and '@companydomain.com' not in email:
+                print(f"Found non-company email: {email} on file {item['name']}")  # Debugging message
+                non_company_emails.add(email)
+
+    return list(non_company_emails)
+
+def batch_process_files(files, service, email_list, exempt_emails):
+    """Processes files in batches and removes permissions for the specified emails, excluding exempt emails."""
+    for file in files:
+        file_id = file['id']
+        try:
+            permissions = service.permissions().list(fileId=file_id, fields="permissions(id, emailAddress)").execute()
+            for permission in permissions.get('permissions', []):
+                email = permission.get('emailAddress')
+                if email and email in email_list and email not in exempt_emails:
+                    print(f"Removing {email} from {file['name']}")  # Debugging message
+                    service.permissions().delete(fileId=file_id, permissionId=permission['id']).execute()
+        except HttpError as error:
+            if error.resp.status == 404:
+                print(f"Permission not found for file {file['name']}. It might have already been removed.")
+            else:
+                print(f"An error occurred: {error}")
+
+def remove_permissions(service, email_list, exempt_emails, folder_id):
+    """Removes permissions for the specified email addresses within a folder and its subfolders in batches."""
+    all_files = list_files_recursive(service, folder_id)
+
+    # Batch size
+    batch_size = 20
+    # Split the files into batches
+    file_batches = [all_files[i:i + batch_size] for i in range(0, len(all_files), batch_size)]
+
+    for batch in file_batches:
+        print(f"Processing batch of {len(batch)} files...")
+        with ThreadPoolExecutor() as executor:
+            executor.submit(batch_process_files, batch, service, email_list, exempt_emails)
+
+        # Delay between batches to avoid rate-limiting
+        time.sleep(2)
+
+def main():
+    # Authenticate and build the Drive API service
+    service = authenticate_drive_api()
+
+    # Ask for the folder ID
+    folder_id = input("Enter the ID of the folder to target: ")
+
+    # Step 1: List non-company email addresses within the specified folder and its subfolders
+    print(f"Listing non-company emails for folder ID: {folder_id}")  # Debugging message
+    non_company_emails = list_non_company_emails(service, folder_id)
+    print("Non-company email addresses with permissions in the specified folder and its subfolders:")
+    for email in non_company_emails:
+        print(email)
+
+    # Step 2: Ask for exempt emails
+    exempt_input = input("Enter any emails you'd like to exempt from permission removal (comma-separated), or type 'yes' to proceed with all: ")
+    if exempt_input.lower() == "yes":
+        exempt_emails = []
+    else:
+        exempt_emails = [email.strip() for email in exempt_input.split(',')]
+
+    # Step 3: Remove permissions for the selected emails within the specified folder and its subfolders
+    print(f"Removing permissions for specified emails from folder ID: {folder_id}")  # Debugging message
+    remove_permissions(service, non_company_emails, exempt_emails, folder_id)
+
+if __name__ == '__main__':
+    main()
